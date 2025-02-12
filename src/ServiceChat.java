@@ -1,3 +1,5 @@
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.io.*;
 import java.net.*;
@@ -11,27 +13,83 @@ import java.net.*;
 public class ServiceChat extends Thread {
 
     private volatile boolean running = true;
-    public static final int NB_USER_MAX = 3;
-    public static int nbUsers = 0;
-
-    private static final Set<String> usernames = new HashSet<>(); // Structure pour pseudo unique
-    public String username; // Pseudo de l'utilisateur
+    private boolean isJavaClient = false;
 
     private static final String CREDS_FILE = "creds.txt";
+    public static final int NB_USER_MAX = 3;
+    public static int nbUsers = 0;
+    public String username; // Pseudo de l'utilisateur
+    private int index;
+
+    private static final Set<String> usernames = new HashSet<>(); // Structure pour pseudo unique
     private static final Map<String, String> userCredentials = new HashMap<>();
     private static final List<ServiceChat> activeClients = Collections.synchronizedList(new ArrayList<>()); // Liste (statique) des clients actifs
+    public static PrintStream[] outputs = new PrintStream[NB_USER_MAX];
 
     private final Socket clientSocket;
     private Scanner clientScanner;
-    public static PrintStream[] outputs = new PrintStream[NB_USER_MAX];
 
-    private boolean isJavaClient = false;
 
-    private int index;
+    // Constants for log formatting
+    private static final String LOG_PREFIX = "[LOG]";
+    private static final String ERROR_PREFIX = "[ERROR]";
+    private static final String INFO_PREFIX = "[INFO]";
+    private static final String WARN_PREFIX = "[WARN]";
+    private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     public ServiceChat(Socket clientSocket) {
         this.clientSocket = clientSocket;
         this.start();
+    }
+
+    // Logger class to handle all output formatting
+    private static class Logger {
+        private static void log(String prefix, String message) {
+            String timestamp = LocalDateTime.now().format(TIME_FORMATTER);
+            System.out.printf("%s %s --- %s%n", timestamp, prefix, message);
+        }
+
+        static void info(String message) {
+            log(INFO_PREFIX, message);
+        }
+
+        static void error(String message) {
+            System.err.printf("%s %s --- %s%n",
+                    LocalDateTime.now().format(TIME_FORMATTER),
+                    ERROR_PREFIX,
+                    message);
+        }
+
+        static void warn(String message) {
+            log(WARN_PREFIX, message);
+        }
+
+        static void debug(String message) {
+            log(LOG_PREFIX, message);
+        }
+    }
+
+    // Client message formatting
+    private static class MessageFormatter {
+        static String systemMessage(String message) {
+            return String.format("[*] --- %s", message);
+        }
+
+        static String errorMessage(String message) {
+            return String.format("[!] --- %s", message);
+        }
+
+        static String promptMessage(String message) {
+            return String.format("[?] --- %s", message);
+        }
+
+        static String privateMessage(String from, String message) {
+            return String.format("[PM from %s] %s", from, message);
+        }
+
+        static String inputPrompt() {
+            return "[>] Enter message: ";
+        }
     }
 
     private synchronized void initStream() {
@@ -40,26 +98,23 @@ public class ServiceChat extends Thread {
             outputs[nbUsers] = new PrintStream(this.clientSocket.getOutputStream());
             this.clientScanner = new Scanner(this.clientSocket.getInputStream());
 
-            // Attendre le message d'identification avec timeout
-            clientSocket.setSoTimeout(5000); // 5 secondes de timeout
+            clientSocket.setSoTimeout(5000);
             try {
                 String firstLine = this.clientScanner.nextLine();
                 this.isJavaClient = "JAVACLIENT_V1".equals(firstLine);
             } catch (Exception e) {
-                // Si timeout ou erreur, considérer comme client Telnet
                 this.isJavaClient = false;
             }
-            // Remettre le socket en mode bloquant
             clientSocket.setSoTimeout(0);
 
             activeClients.add(this);
             nbUsers++;
 
-            // Log le type de client
-            System.out.println("[LOG] --- New " + (isJavaClient ? "Java" : "Telnet") +
-                    " client connected from " + clientSocket.getRemoteSocketAddress());
+            Logger.info(String.format("New %s client connected from %s",
+                    (isJavaClient ? "Java" : "Telnet"),
+                    clientSocket.getRemoteSocketAddress()));
         } catch (Exception e) {
-            e.printStackTrace();
+            Logger.error("Failed to initialize stream: " + e.getMessage());
         }
     }
 
@@ -94,8 +149,7 @@ public class ServiceChat extends Thread {
     private static void loadCredentials() {
         try {
             File file = new File(CREDS_FILE);
-            if (!file.exists()) { // POUR DU DEBUG --> Temporaire
-                // Crée le fichier avec des utilisateurs par défaut si n'existe pas
+            if (!file.exists()) {
                 try (PrintWriter writer = new PrintWriter(file)) {
                     writer.println("alice:pass123");
                     writer.println("bob:pass456");
@@ -112,14 +166,13 @@ public class ServiceChat extends Thread {
                     }
                 }
             }
-            System.out.println("[LOG] --- Credentials loaded successfully");
-
+            Logger.info("Credentials loaded successfully");
         } catch (IOException e) {
-            System.err.println("[ERROR] --- Failed to load credentials: " + e.getMessage());
+            Logger.error("Failed to load credentials: " + e.getMessage());
         }
     }
 
-    // Sauvegarde les credentials dans le fichier
+    // Sauvegarde les credentials dans le fichier --> Servira plus tard pour l'inscription (avec addUser)
     private static synchronized void saveCredentials() {
         try (PrintWriter writer = new PrintWriter(new FileWriter(CREDS_FILE))) {
             for (Map.Entry<String, String> entry : userCredentials.entrySet()) {
@@ -132,7 +185,7 @@ public class ServiceChat extends Thread {
         }
     }
 
-    // Ajoute un nouvel utilisateur
+    // Ajoute un nouvel utilisateur --> Servira plus tard pour l'inscription
     public static synchronized boolean addUser(String username, String password) {
         if (userCredentials.containsKey(username)) {
             return false;
@@ -260,11 +313,12 @@ public class ServiceChat extends Thread {
         return false;
     }
 
-    private synchronized void disconnect() {
+    private void disconnect() {
         running = false;
         try {
             if (username != null) {
-                broadcast("[*] --- " + username + " has disconnected | Total users now : " + (nbUsers - 1));
+                broadcast(MessageFormatter.systemMessage(username +
+                        " has disconnected | Total users now : " + (nbUsers - 1)));
                 synchronized(usernames) {
                     usernames.remove(username);
                 }
@@ -272,13 +326,9 @@ public class ServiceChat extends Thread {
 
             activeClients.remove(this);
 
-            if (outputs[index] != null) {
-                outputs[index].close();
-            }
-
-            if (clientScanner != null) {
-                clientScanner.close();  // Ferme le Scanner ici
-            }
+            // Close resources
+            if (outputs[index] != null) outputs[index].close();
+            if (clientScanner != null) clientScanner.close();
 
             if (nbUsers > 0) {
                 nbUsers--;
@@ -292,11 +342,12 @@ public class ServiceChat extends Thread {
                 clientSocket.close();
             }
 
-            System.out.println("[LOG] --- " + (username != null ? "User '" + username + "'" : "Unauthenticated user") +
-                    " disconnected. Remaining users: " + nbUsers);
+            Logger.info(String.format("%s disconnected. Remaining users: %d",
+                    (username != null ? "User '" + username + "'" : "Unauthenticated user"),
+                    nbUsers));
 
         } catch (IOException e) {
-            System.err.println("[ERROR] --- Error during disconnect: " + e.getMessage());
+            Logger.error("Error during disconnect: " + e.getMessage());
         }
     }
 
@@ -306,28 +357,22 @@ public class ServiceChat extends Thread {
         ServiceChat targetClient = findClientByUsername(targetUser);
 
         if (targetClient == null) {
-            senderOut.println("[!] User '" + targetUser + "' not found");
+            senderOut.println(MessageFormatter.errorMessage("User '" + targetUser + "' not found"));
             return;
         }
 
-        // Envoie au destinataire
+        String formattedSenderTag = formatUserTag(username);
+        String formattedTargetTag = formatUserTag(targetUser);
+
+        // Send to recipient
         PrintStream targetOut = outputs[targetClient.index];
-        targetOut.println("[PM from " + formatUserTag(username) + "] " + message);
-        // Confirmation à l'expéditeur
-        senderOut.println("[PM to " + formatUserTag(targetUser) + "] " + message);
+        targetOut.println(MessageFormatter.privateMessage(formattedSenderTag, message));
 
-        // Log le message privé côté serveur
-        System.out.println("[LOG] --- Private message from " + formatUserTag(username) + " to " + formatUserTag(targetUser) + ": " + message);
+        // Confirmation to sender
+        senderOut.println(MessageFormatter.privateMessage("to " + formattedTargetTag, message));
 
-
-//        // Envoie au destinataire
-//        PrintStream targetOut = outputs[targetClient.index];
-//        targetOut.println("[PM from " + username + "] " + message);
-//        // Confirmation à l'expéditeur
-//        senderOut.println("[PM to " + targetUser + "] " + message);
-//
-//        // Log le message privé côté serveur
-//        System.out.println("[LOG] --- Private message from '" + username + "' to '" + targetUser + "': " + message);
+        Logger.debug(String.format("Private message from %s to %s: %s",
+                formattedSenderTag, formattedTargetTag, message));
     }
 
     private void sendUserList(PrintStream out) {
@@ -393,8 +438,7 @@ public class ServiceChat extends Thread {
                 outputs[i].println(message);
             }
         }
-        // Log le message côté serveur
-        System.out.println("[LOG] --- Broadcast: " + message);
+        Logger.debug("Broadcast: " + message);
     }
 
     public static void main(String[] args) {
@@ -430,7 +474,6 @@ public class ServiceChat extends Thread {
 
         } catch (IOException e) {
             System.err.println("[ERROR] --- Server error: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 }
